@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>VOID — M3U8 Player</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23050507'/><text x='16' y='23' font-family='sans-serif' font-size='20' font-weight='bold' fill='white' text-anchor='middle'>V</text></svg>">
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1079,6 +1080,9 @@ let ambientFailed = false;
 let clickTimeout = null;
 const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
 let currentSpeedIdx = 3;
+let hlsFatalRetries = 0;
+let hlsMediaRecoveries = 0;
+const HLS_MAX_FATAL_RETRIES = 5;
 
 const SVG_PLAY = '<path d="M8 5v14l11-7z"/>';
 const SVG_PAUSE = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
@@ -1096,7 +1100,13 @@ function loadStream(url) {
   if (ambientTimeout) { clearTimeout(ambientTimeout); ambientTimeout = null; }
   ambientFailed = false;
   if (hls) { hls.destroy(); hls = null; }
-  if (!url) { setInfo('ERROR', '—', '—', '—'); return; }
+  if (!url) {
+    setInfo('IDLE', '—', '—', '—');
+    localStorage.removeItem('void-stream-url');
+    localStorage.removeItem('void-stream-dur');
+    return;
+  }
+  localStorage.setItem('void-stream-url', url);
 
   loadingSpinner.classList.add('show');
   setInfo('LOADING', '—', '—', '—');
@@ -1116,26 +1126,69 @@ function loadStream(url) {
     return;
   }
 
-  hls = new Hls({ maxBufferLength: 30, maxMaxBufferLength: 120 });
+  hlsFatalRetries = 0;
+  hlsMediaRecoveries = 0;
+  hls = new Hls({
+    maxBufferLength: 30,
+    maxMaxBufferLength: 120,
+    fragLoadPolicy: {
+      default: {
+        maxTimeToFirstByteMs: 10000,
+        maxLoadTimeMs: 120000,
+        timeoutRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 16000, backoff: 'exponential' },
+        errorRetry: { maxNumRetry: 10, retryDelayMs: 1000, maxRetryDelayMs: 30000, backoff: 'exponential' },
+      },
+    },
+  });
   hls.loadSource(url);
   hls.attachMedia(video);
 
   hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
     loadingSpinner.classList.remove('show');
     const lvl = data.levels[0];
-    const res = lvl ? `${lvl.width}×${lvl.height}` : '—';
+    const res = (lvl && lvl.width > 0 && lvl.height > 0) ? `${lvl.width}×${lvl.height}` : '—';
     const codecs = lvl?.attrs?.CODECS || '—';
     setInfo('PLAYING', res, '...', codecs);
     video.play();
   });
 
+  hls.on(Hls.Events.BUFFER_CODECS, (_, data) => {
+    const parts = [];
+    if (data.video) parts.push(data.video.levelCodec || data.video.codec);
+    if (data.audio) parts.push(data.audio.levelCodec || data.audio.codec);
+    if (parts.length) infoCodec.textContent = parts.join(', ');
+  });
+
   hls.on(Hls.Events.ERROR, (_, data) => {
-    if (data.fatal) {
-      loadingSpinner.classList.remove('show');
-      setInfo('ERROR', '—', '—', '—');
-      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-      else hls.destroy();
+    if (!data.fatal) return;
+
+    if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+      hlsFatalRetries++;
+      if (hlsFatalRetries <= HLS_MAX_FATAL_RETRIES) {
+        setInfo('RETRYING', infoRes.textContent, infoDur.textContent, infoCodec.textContent);
+        setTimeout(() => { if (hls) hls.startLoad(); }, 1000 * hlsFatalRetries);
+        return;
+      }
     }
+
+    if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+      hlsMediaRecoveries++;
+      if (hlsMediaRecoveries === 1) {
+        setInfo('RECOVERING', infoRes.textContent, infoDur.textContent, infoCodec.textContent);
+        hls.recoverMediaError();
+        return;
+      }
+      if (hlsMediaRecoveries === 2) {
+        hls.swapAudioCodec();
+        hls.recoverMediaError();
+        return;
+      }
+    }
+
+    loadingSpinner.classList.remove('show');
+    setInfo('ERROR', '—', '—', '—');
+    hls.destroy();
+    hls = null;
   });
 }
 
@@ -1186,6 +1239,13 @@ video.addEventListener('pause', () => {
 video.addEventListener('loadedmetadata', () => {
   timeDuration.textContent = fmtTime(video.duration);
   infoDur.textContent = fmtTime(video.duration);
+  if (isFinite(video.duration) && video.duration > 0) {
+    localStorage.setItem('void-stream-dur', video.duration);
+  }
+  if (infoRes.textContent === '—' || infoRes.textContent === '0×0') {
+    const w = video.videoWidth, h = video.videoHeight;
+    if (w > 0 && h > 0) infoRes.textContent = `${w}×${h}`;
+  }
 });
 
 video.addEventListener('timeupdate', () => {
@@ -1310,14 +1370,13 @@ function showVolumeOsd() {
 muteBtn.addEventListener('click', () => {
   video.muted = !video.muted;
   updateVolumeIcon();
-  showVolumeOsd();
 });
 
 volumeSlider.addEventListener('input', () => {
   video.volume = parseFloat(volumeSlider.value);
   video.muted = false;
   updateVolumeIcon();
-  showVolumeOsd();
+  localStorage.setItem('void-stream-vol', video.volume);
 });
 
 /* ═══════════════════════════
@@ -1451,6 +1510,7 @@ document.addEventListener('keydown', (e) => {
       video.muted = false;
       updateVolumeIcon();
       showVolumeOsd();
+      localStorage.setItem('void-stream-vol', video.volume);
       break;
     case 'arrowdown':
       e.preventDefault();
@@ -1458,6 +1518,7 @@ document.addEventListener('keydown', (e) => {
       volumeSlider.value = video.volume;
       updateVolumeIcon();
       showVolumeOsd();
+      localStorage.setItem('void-stream-vol', video.volume);
       break;
     case '<':
     case ',':
@@ -1540,8 +1601,32 @@ urlInput.addEventListener('keydown', (e) => {
    INIT
    ═══════════════════════════ */
 showControls();
-const initUrl = urlInput.value.trim();
-if (initUrl) loadStream(initUrl);
+
+const savedVol = localStorage.getItem('void-stream-vol');
+if (savedVol !== null) {
+  const v = parseFloat(savedVol);
+  video.volume = v;
+  volumeSlider.value = v;
+  updateVolumeIcon();
+}
+
+const savedDur = localStorage.getItem('void-stream-dur');
+if (savedDur) {
+  const d = parseFloat(savedDur);
+  if (isFinite(d) && d > 0) {
+    timeDuration.textContent = fmtTime(d);
+    infoDur.textContent = fmtTime(d);
+  }
+}
+
+const savedUrl = localStorage.getItem('void-stream-url');
+if (savedUrl) {
+  urlInput.value = savedUrl;
+  loadStream(savedUrl);
+} else {
+  const initUrl = urlInput.value.trim();
+  if (initUrl) loadStream(initUrl);
+}
 </script>
 </body>
 </html>
