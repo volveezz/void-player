@@ -1082,7 +1082,9 @@ const SPEEDS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2];
 let currentSpeedIdx = 3;
 let hlsFatalRetries = 0;
 let hlsMediaRecoveries = 0;
+let hlsFullReloads = 0;
 const HLS_MAX_FATAL_RETRIES = 5;
+const HLS_MAX_FULL_RELOADS = 3;
 
 const SVG_PLAY = '<path d="M8 5v14l11-7z"/>';
 const SVG_PAUSE = '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>';
@@ -1095,7 +1097,7 @@ const SVG_FS_EXIT = '<path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-
 /* ═══════════════════════════
    HLS LOADING
    ═══════════════════════════ */
-function loadStream(url) {
+function loadStream(url, resumeFrom) {
   if (ambientRAF) { cancelAnimationFrame(ambientRAF); ambientRAF = null; }
   if (ambientTimeout) { clearTimeout(ambientTimeout); ambientTimeout = null; }
   ambientFailed = false;
@@ -1128,6 +1130,7 @@ function loadStream(url) {
 
   hlsFatalRetries = 0;
   hlsMediaRecoveries = 0;
+  if (resumeFrom === undefined) hlsFullReloads = 0;
   hls = new Hls({
     maxBufferLength: 30,
     maxMaxBufferLength: 120,
@@ -1137,6 +1140,22 @@ function loadStream(url) {
         maxLoadTimeMs: 120000,
         timeoutRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 16000, backoff: 'exponential' },
         errorRetry: { maxNumRetry: 10, retryDelayMs: 1000, maxRetryDelayMs: 30000, backoff: 'exponential' },
+      },
+    },
+    manifestLoadPolicy: {
+      default: {
+        maxTimeToFirstByteMs: 10000,
+        maxLoadTimeMs: 20000,
+        timeoutRetry: { maxNumRetry: 4, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: 'exponential' },
+        errorRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 16000, backoff: 'exponential' },
+      },
+    },
+    playlistLoadPolicy: {
+      default: {
+        maxTimeToFirstByteMs: 10000,
+        maxLoadTimeMs: 20000,
+        timeoutRetry: { maxNumRetry: 4, retryDelayMs: 1000, maxRetryDelayMs: 8000, backoff: 'exponential' },
+        errorRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 16000, backoff: 'exponential' },
       },
     },
   });
@@ -1149,7 +1168,8 @@ function loadStream(url) {
     const res = (lvl && lvl.width > 0 && lvl.height > 0) ? `${lvl.width}×${lvl.height}` : '—';
     const codecs = lvl?.attrs?.CODECS || '—';
     setInfo('PLAYING', res, '...', codecs);
-    video.play();
+    if (resumeFrom > 0) video.currentTime = resumeFrom;
+    video.play().catch(() => {});
   });
 
   hls.on(Hls.Events.BUFFER_CODECS, (_, data) => {
@@ -1159,15 +1179,58 @@ function loadStream(url) {
     if (parts.length) infoCodec.textContent = parts.join(', ');
   });
 
+  /** Reset retry state whenever a fragment plays successfully */
+  hls.on(Hls.Events.FRAG_CHANGED, () => {
+    hlsFatalRetries = 0;
+    hlsMediaRecoveries = 0;
+    const st = infoStatus.textContent;
+    if (st === 'RETRYING' || st === 'BUFFERING' || st === 'RELOADING' || st === 'RECOVERING') {
+      loadingSpinner.classList.remove('show');
+      setInfo('PLAYING', infoRes.textContent, infoDur.textContent, infoCodec.textContent);
+    }
+  });
+
   hls.on(Hls.Events.ERROR, (_, data) => {
-    if (!data.fatal) return;
+    /* Non-fatal: show feedback when buffer is running low during retries */
+    if (!data.fatal) {
+      if (data.details === Hls.ErrorDetails.FRAG_LOAD_ERROR ||
+          data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT) {
+        const buf = video.buffered;
+        const ahead = buf.length > 0 ? buf.end(buf.length - 1) - video.currentTime : 0;
+        if (ahead < 5) {
+          loadingSpinner.classList.add('show');
+          setInfo('BUFFERING', infoRes.textContent, infoDur.textContent, infoCodec.textContent);
+        }
+      }
+      return;
+    }
 
     if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
       hlsFatalRetries++;
       if (hlsFatalRetries <= HLS_MAX_FATAL_RETRIES) {
         setInfo('RETRYING', infoRes.textContent, infoDur.textContent, infoCodec.textContent);
-        setTimeout(() => { if (hls) hls.startLoad(); }, 1000 * hlsFatalRetries);
+        loadingSpinner.classList.add('show');
+        /* On later retries, skip ahead past the broken segment */
+        const skipTo = hlsFatalRetries >= 3 ? video.currentTime + 10 : -1;
+        const hlsAtRetry = hls;
+        setTimeout(() => {
+          if (!hls || hls !== hlsAtRetry) return;
+          if (skipTo > 0) hls.startLoad(skipTo);
+          else hls.startLoad();
+        }, 2000 * hlsFatalRetries);
         return;
+      }
+      /* startLoad retries exhausted — full stream reload */
+      hlsFullReloads++;
+      if (hlsFullReloads <= HLS_MAX_FULL_RELOADS) {
+        const streamUrl = urlInput.value.trim();
+        const resumeTime = video.currentTime || 0;
+        if (streamUrl) {
+          setInfo('RELOADING', '—', '—', '—');
+          loadingSpinner.classList.add('show');
+          setTimeout(() => loadStream(streamUrl, resumeTime), 3000 * hlsFullReloads);
+          return;
+        }
       }
     }
 
@@ -1182,6 +1245,18 @@ function loadStream(url) {
         hls.swapAudioCodec();
         hls.recoverMediaError();
         return;
+      }
+      /* Media recovery failed — full reload as last resort */
+      hlsFullReloads++;
+      if (hlsFullReloads <= HLS_MAX_FULL_RELOADS) {
+        const streamUrl = urlInput.value.trim();
+        const resumeTime = video.currentTime || 0;
+        if (streamUrl) {
+          setInfo('RELOADING', '—', '—', '—');
+          loadingSpinner.classList.add('show');
+          setTimeout(() => loadStream(streamUrl, resumeTime), 3000 * hlsFullReloads);
+          return;
+        }
       }
     }
 
@@ -1215,7 +1290,15 @@ function fmtTime(sec) {
    PLAY / PAUSE
    ═══════════════════════════ */
 function togglePlay() {
-  if (video.paused) video.play(); else video.pause();
+  if (video.paused) {
+    video.play().catch(() => {
+      /* Source lost (e.g. after fatal error destroyed hls) — reload stream */
+      const url = urlInput.value.trim();
+      if (url) loadStream(url);
+    });
+  } else {
+    video.pause();
+  }
 }
 
 function showPulse(isPlay) {
