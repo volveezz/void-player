@@ -1071,6 +1071,8 @@ const ambientCanvas = $('#ambientCanvas');
 const ambientCtx = ambientCanvas.getContext('2d', { willReadFrequently: true });
 
 let hls = null;
+let manifestBlobUrl = null;
+let loadGeneration = 0;
 let controlsTimeout = null;
 let volumeOsdTimeout = null;
 let isSeeking = false;
@@ -1095,13 +1097,68 @@ const SVG_FS_ENTER = '<path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h
 const SVG_FS_EXIT = '<path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/>';
 
 /* ═══════════════════════════
+   M3U8 PREPROCESSING
+   ═══════════════════════════ */
+
+/* Some providers obfuscate segment URLs with Caesar cipher to prevent hotlinking */
+function caesarDecode(str, shift) {
+  const s = ((shift % 26) + 26) % 26;
+  return str.replace(/[a-zA-Z]/g, ch => {
+    const base = ch >= 'a' ? 97 : 65;
+    return String.fromCharCode(((ch.charCodeAt(0) - base + s) % 26) + base);
+  });
+}
+
+/* Parses Caesar-encoded playlist config: expiry,shift,baseUrl */
+function parseEncodedConf(m3u8Text) {
+  const match = m3u8Text.match(/^#TLDVCONF:(.+)$/m);
+  if (!match) return null;
+  const parts = match[1];
+  const c1 = parts.indexOf(',');
+  if (c1 === -1) return null;
+  const c2 = parts.indexOf(',', c1 + 1);
+  if (c2 === -1) return null;
+  return {
+    shift: parseInt(parts.substring(c1 + 1, c2), 10),
+    baseUrl: parts.substring(c2 + 1).trim(),
+  };
+}
+
+/* Transforms encoded M3U8 into standard HLS with absolute segment URLs */
+function decodePlaylist(m3u8Text, shift, baseUrl) {
+  if (m3u8Text.includes('#EXT-X-STREAM-INF')) return null;
+  return m3u8Text.split('\n').map(line => {
+    if (line.startsWith('#TLDVCONF:')) return '';
+    if (line.startsWith('#') || line.trim() === '') return line;
+    return baseUrl + caesarDecode(line.trim(), shift);
+  }).join('\n');
+}
+
+/* Fetches M3U8, decodes if encoded, returns blob URL or null for standard playlists */
+async function resolveManifest(url) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const text = await resp.text();
+    const conf = parseEncodedConf(text);
+    if (!conf) return null;
+    const decoded = decodePlaylist(text, conf.shift, conf.baseUrl);
+    if (!decoded) return null;
+    return URL.createObjectURL(new Blob([decoded], { type: 'application/vnd.apple.mpegurl' }));
+  } catch {
+    return null;
+  }
+}
+
+/* ═══════════════════════════
    HLS LOADING
    ═══════════════════════════ */
-function loadStream(url, resumeFrom) {
+async function loadStream(url, resumeFrom) {
   if (ambientRAF) { cancelAnimationFrame(ambientRAF); ambientRAF = null; }
   if (ambientTimeout) { clearTimeout(ambientTimeout); ambientTimeout = null; }
   ambientFailed = false;
   if (hls) { hls.destroy(); hls = null; }
+  if (manifestBlobUrl) { URL.revokeObjectURL(manifestBlobUrl); manifestBlobUrl = null; }
   if (!url) {
     setInfo('IDLE', '—', '—', '—');
     localStorage.removeItem('void-stream-url');
@@ -1110,12 +1167,24 @@ function loadStream(url, resumeFrom) {
   }
   localStorage.setItem('void-stream-url', url);
 
+  const gen = ++loadGeneration;
+
   loadingSpinner.classList.add('show');
   setInfo('LOADING', '—', '—', '—');
 
+  const blobUrl = await resolveManifest(url);
+  if (gen !== loadGeneration) {
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
+    return;
+  }
+  if (blobUrl) manifestBlobUrl = blobUrl;
+  const sourceUrl = blobUrl || url;
+
   if (video.canPlayType('application/vnd.apple.mpegurl')) {
-    video.src = url;
+    video.src = '';
+    video.src = sourceUrl;
     video.addEventListener('loadedmetadata', () => {
+      if (manifestBlobUrl) { URL.revokeObjectURL(manifestBlobUrl); manifestBlobUrl = null; }
       loadingSpinner.classList.remove('show');
       setInfo('LIVE', '—', fmtTime(video.duration), '—');
       video.play();
@@ -1159,7 +1228,7 @@ function loadStream(url, resumeFrom) {
       },
     },
   });
-  hls.loadSource(url);
+  hls.loadSource(sourceUrl);
   hls.attachMedia(video);
 
   hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
@@ -1683,6 +1752,10 @@ urlInput.addEventListener('keydown', (e) => {
 /* ═══════════════════════════
    INIT
    ═══════════════════════════ */
+window.addEventListener('beforeunload', () => {
+  if (manifestBlobUrl) URL.revokeObjectURL(manifestBlobUrl);
+});
+
 showControls();
 
 const savedVol = localStorage.getItem('void-stream-vol');
